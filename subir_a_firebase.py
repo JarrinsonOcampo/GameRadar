@@ -18,6 +18,7 @@ Dependencias (ver requirements.txt):
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import firebase_admin
@@ -26,26 +27,44 @@ from firebase_admin import credentials, db
 import scraper  # el mismo scraper.py de siempre, copiado en esta carpeta
 
 # --------------------------------------------------------------------
-# Monedas que el backend deja listas en Firebase. Empieza con las que
-# más usan tus usuarios y agrega más líneas cuando quieras cubrir otra
-# moneda (cada una agrega tiempo de escaneo, pero no bloquea al usuario
-# porque esto corre en la nube, no en su celular).
-# Formato: (cc_code, symbol, no_decimals, gog_currency, free_badge)
+# Las mismas 10 monedas que ya soporta la app (ver MONEDAS en
+# MainActivity.kt). El "free_badge" no varía por moneda: el texto que
+# ya usaba PythonBridge.escanearOfertas() siempre era "¡GRATIS!" por
+# defecto (nunca se pasaba otro valor desde Kotlin), así que se deja
+# igual acá para no cambiar el comportamiento.
+# Formato: (cc_code, symbol, no_decimals, gog_currency)
 # --------------------------------------------------------------------
+FREE_BADGE = "¡GRATIS!"
+
 MONEDAS = [
-    ("co", "COL$", True, "USD", "¡GRATIS!"),   # Colombia
-    ("us", "$", False, "USD", "FREE"),         # Estados Unidos / genérico USD
+    ("co", "COL$", True, "USD"),    # Colombia
+    ("us", "$", False, "USD"),      # Estados Unidos
+    ("es", "€", False, "EUR"),      # España / Eurozona
+    ("mx", "MEX$", False, "USD"),   # México
+    ("ar", "ARS$", True, "USD"),    # Argentina
+    ("cl", "CLP$", True, "USD"),    # Chile
+    ("pe", "S/", False, "USD"),     # Perú
+    ("br", "R$", False, "BRL"),     # Brasil
+    ("gb", "£", False, "GBP"),      # Reino Unido
+    ("ca", "CDN$", False, "CAD"),   # Canadá
 ]
 
+# Cuántas monedas se escanean AL MISMO TIEMPO. Subir este número acelera
+# el job, pero golpea Steam/Epic/GOG con más peticiones simultáneas y
+# aumenta el riesgo de que te empiecen a bloquear (rate limiting), lo
+# que dañaría los datos de TODAS las monedas a la vez. 3 es un punto
+# medio razonable entre velocidad y no abusar de esos sitios.
+MONEDAS_EN_PARALELO = 3
 
-def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency, free_badge):
+
+def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     print(f"[{cc_code}] escaneando Steam + Epic + GOG...")
     json_texto = scraper.get_game_deals(
         cc_code=cc_code,
         symbol=symbol,
         no_decimals=no_decimals,
         gog_currency=gog_currency,
-        free_badge=free_badge,
+        free_badge=FREE_BADGE,
         tiendas="steam,epic,gog",
     )
     juegos = json.loads(json_texto)
@@ -65,13 +84,19 @@ def main():
         "databaseURL": os.environ["FIREBASE_DATABASE_URL"],
     })
 
-    for cc_code, symbol, no_decimals, gog_currency, free_badge in MONEDAS:
-        try:
-            escanear_y_subir(cc_code, symbol, no_decimals, gog_currency, free_badge)
-        except Exception as e:
-            # Si una moneda falla, las demás igual deben subir su parte,
-            # y NO se debe borrar lo que ya había en Firebase para esa moneda.
-            print(f"[{cc_code}] ERROR: {type(e).__name__}: {e}")
+    with ThreadPoolExecutor(max_workers=MONEDAS_EN_PARALELO) as pool:
+        futuros = {
+            pool.submit(escanear_y_subir, cc, symbol, no_dec, gog): cc
+            for cc, symbol, no_dec, gog in MONEDAS
+        }
+        for futuro in as_completed(futuros):
+            cc_code = futuros[futuro]
+            try:
+                futuro.result()
+            except Exception as e:
+                # Si una moneda falla, las demás igual deben subir su parte,
+                # y NO se debe borrar lo que ya había en Firebase para esa moneda.
+                print(f"[{cc_code}] ERROR: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

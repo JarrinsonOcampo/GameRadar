@@ -3,6 +3,11 @@
 # Corre subir_a_firebase.py automáticamente cada 4 horas (hora UTC) y
 # también se puede lanzar a mano desde la pestaña "Actions" de GitHub
 # con el botón "Run workflow" (gracias a workflow_dispatch).
+#
+# Con las 10 monedas escaneadas en grupos de 3 en paralelo, un run
+# completo tarda entre 8 y 15 minutos aprox. (antes tardaba ~4 min con
+# solo 2 monedas secuenciales). A 4 corridas al día, esto usa entre
+# ~30 y ~60 minutos de los 2000 minutos/mes gratis de GitHub Actions.
 
 name: Escanear ofertas y subir a Firebase
 
@@ -14,7 +19,7 @@ on:
 jobs:
   escanear:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Descargar el repo
