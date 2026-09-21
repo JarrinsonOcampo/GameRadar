@@ -7,6 +7,14 @@ Realtime Database, en /ofertas/{cc_code}. La app en Kotlin solo lee ese
 JSON ya armado (ver FirebaseOfertasRepo.kt), así que la carga es casi
 instantánea para el usuario.
 
+NOVEDAD: cada juego ahora lleva un campo "desde" (milisegundos desde 1970,
+UTC) con el momento en que este script detectó su descuento actual:
+    - juego que ya estaba con el MISMO descuento  -> conserva su "desde"
+    - juego nuevo, o que cambió de porcentaje      -> "desde" = ahora
+    - juegos que ya existían antes de esta mejora  -> "desde" = 0
+      (0 significa "no se sabe cuándo entró", y la app no los muestra
+      en la sección de novedades)
+
 Variables de entorno que este script espera (las pone el workflow de
 GitHub Actions, ver escanear.yml):
     GOOGLE_APPLICATION_CREDENTIALS  -> ruta al JSON de la cuenta de servicio de Firebase
@@ -18,6 +26,7 @@ Dependencias (ver requirements.txt):
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -57,6 +66,42 @@ MONEDAS = [
 MONEDAS_EN_PARALELO = 3
 
 
+def cargar_previos(cc_code):
+    """
+    Lee de Firebase la lista del escaneo anterior y la devuelve como
+    {link: juego}. Devuelve None si nunca se había subido nada para esta
+    moneda (primer escaneo).
+    """
+    previo = db.reference(f"/ofertas/{cc_code}/juegos").get()
+    if not previo:
+        return None
+    # Firebase devuelve una lista, o un dict si la lista quedó con huecos.
+    if isinstance(previo, dict):
+        previo = previo.values()
+    return {
+        j["link"]: j
+        for j in previo
+        if isinstance(j, dict) and j.get("link")
+    }
+
+
+def marcar_fechas(juegos, previos, ahora_ms):
+    """Agrega el campo "desde" a cada juego según el escaneo anterior."""
+    for juego in juegos:
+        if previos is None:
+            # Primer escaneo de esta moneda: no se sabe cuándo entró nada.
+            juego["desde"] = 0
+            continue
+
+        anterior = previos.get(juego.get("link"))
+        if anterior is not None and anterior.get("desc") == juego.get("desc"):
+            # Mismo juego, mismo descuento: conserva la fecha original.
+            juego["desde"] = anterior.get("desde", 0)
+        else:
+            # Juego nuevo en la lista, o cambió su porcentaje de descuento.
+            juego["desde"] = ahora_ms
+
+
 def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     print(f"[{cc_code}] escaneando Steam + Epic + GOG...")
     json_texto = scraper.get_game_deals(
@@ -68,7 +113,19 @@ def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
         tiendas="steam,epic,gog",
     )
     juegos = json.loads(json_texto)
-    print(f"[{cc_code}] {len(juegos)} ofertas encontradas, subiendo a Firebase...")
+
+    if not juegos:
+        # Un escaneo vacío casi siempre es un bloqueo o un fallo temporal.
+        # Si se subiera, borraría la lista buena que ya está en Firebase
+        # y el próximo escaneo marcaría TODO como "nuevo".
+        print(f"[{cc_code}] 0 ofertas encontradas; no se sube nada para no borrar lo anterior.")
+        return
+
+    previos = cargar_previos(cc_code)
+    ahora_ms = int(time.time() * 1000)
+    marcar_fechas(juegos, previos, ahora_ms)
+    nuevos = sum(1 for j in juegos if j["desde"] == ahora_ms)
+    print(f"[{cc_code}] {len(juegos)} ofertas ({nuevos} nuevas o con descuento distinto), subiendo a Firebase...")
 
     db.reference(f"/ofertas/{cc_code}").set({
         "actualizado": datetime.now(timezone.utc).isoformat(),
