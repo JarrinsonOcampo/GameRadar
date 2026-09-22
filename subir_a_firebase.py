@@ -80,7 +80,15 @@ MONEDAS_EN_PARALELO = 3
 # bloquearon: NO se sobrescribe lo que ya hay en Firebase.
 MINIMO_OFERTAS_VALIDAS = 1
 
-VERSION_RESUMEN = 1
+VERSION_RESUMEN = 2
+
+# Un juego con este % de descuento o más cuenta para "grandes_total" en el resumen
+# diario (p. ej. "45 juegos con más de 50% de descuento hoy").
+DESCUENTO_GRANDE = 50
+
+# Cuántos nombres de ejemplo van en meta.novedades_top (para el texto de la
+# notificación, tipo "Portal 2, Elden Ring y 12 más entraron en descuento").
+MAX_EJEMPLOS_NOVEDADES = 3
 
 
 # --------------------------------------------------------------------
@@ -127,7 +135,14 @@ def _cargar_previos(cc_code):
 
 
 def _asignar_desde(juegos, previos):
+    """Además de poner 'desde' en cada juego (ver docstring del módulo), cuenta cuántos
+    son 'novedades' de ESTA corrida: juegos nuevos o que cambiaron de % (no cuenta la
+    primera corrida de una moneda, para no marcar de una vez ~8.000 juegos como
+    novedad). Ese conteo alimenta el aviso de "hay juegos nuevos en descuento".
+    Devuelve la lista de esas novedades (para sacar ejemplos), ordenada de mayor a
+    menor descuento."""
     ahora_ms = int(time.time() * 1000)
+    novedades = []
     for j in juegos:
         anterior = previos.get(id_juego(j.get("link", "")))
         if anterior is not None and anterior[0] == int(j.get("desc") or 0):
@@ -136,6 +151,9 @@ def _asignar_desde(juegos, previos):
             j["desde"] = 0                    # primera corrida: "ya estaba antes"
         else:
             j["desde"] = ahora_ms             # juego nuevo o cambió el porcentaje
+            novedades.append(j)
+    novedades.sort(key=lambda j: int(j.get("desc") or 0), reverse=True)
+    return novedades
 
 
 # --------------------------------------------------------------------
@@ -154,13 +172,16 @@ def _elegir_control(links):
     return [{"link": l, "id": id_juego(l)} for l in dict.fromkeys(elegidos)]
 
 
-def construir_nodos(juegos, actualizado_iso):
-    """A partir de la lista final (con 'desde') arma los tres nodos de Firebase."""
+def construir_nodos(juegos, actualizado_iso, novedades):
+    """A partir de la lista final (con 'desde') arma los tres nodos de Firebase.
+    [novedades]: lo que devolvió _asignar_desde (juegos nuevos o con % cambiado en
+    esta corrida, ya ordenados de mayor a menor descuento)."""
     d = {}
     estado = {}
     gratis = {}
     ids = {}
     links = []
+    grandes_total = 0
 
     for j in juegos:
         link = j.get("link") or ""
@@ -178,6 +199,8 @@ def construir_nodos(juegos, actualizado_iso):
         desc = int(j.get("desc") or 0)
         d[jid] = {"d": desc, "o": j.get("p_orig") or "", "p": j.get("p_final") or ""}
         estado[jid] = f"{desc}|{int(j.get('desde') or 0)}"
+        if desc >= DESCUENTO_GRANDE:
+            grandes_total += 1
 
         # Mismo criterio que el Worker anterior: desc >= 100 y sin repetir link
         # (se queda con la primera aparición).
@@ -199,6 +222,8 @@ def construir_nodos(juegos, actualizado_iso):
         "\n".join(sorted(f"{k}:{v['d']}" for k, v in d.items())).encode("utf-8")
     ).hexdigest()[:16]
 
+    nombres_novedades = [n.get("nombre") or "Desconocido" for n in novedades[:MAX_EJEMPLOS_NOVEDADES]]
+
     return {
         "ofertas": {
             "actualizado": actualizado_iso,
@@ -211,6 +236,12 @@ def construir_nodos(juegos, actualizado_iso):
                 "total": len(d),
                 "actualizado": actualizado_iso,
                 "version": VERSION_RESUMEN,
+                # Para el aviso de "hay juegos nuevos en descuento" (por revisión):
+                "novedades": len(novedades),
+                "novedades_top": nombres_novedades,
+                # Para el resumen diario (lectura ultraliviana, solo estos 2 números):
+                "gratis_total": len(gratis),
+                "grandes_total": grandes_total,
             },
             "control": _elegir_control(links),
             "gratis": list(gratis.values()),
@@ -238,8 +269,8 @@ def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     if len(juegos) < MINIMO_OFERTAS_VALIDAS:
         raise RuntimeError("el scraper devolvió 0 ofertas; se conserva lo anterior en Firebase")
 
-    _asignar_desde(juegos, _cargar_previos(cc_code))
-    nodos = construir_nodos(juegos, datetime.now(timezone.utc).isoformat())
+    _asignar_desde_resultado = _asignar_desde(juegos, _cargar_previos(cc_code))
+    nodos = construir_nodos(juegos, datetime.now(timezone.utc).isoformat(), _asignar_desde_resultado)
 
     print(f"[{cc_code}] {len(juegos)} ofertas encontradas, subiendo a Firebase...")
     # Una sola escritura atómica en tres rutas: o se guardan las tres o ninguna, así
