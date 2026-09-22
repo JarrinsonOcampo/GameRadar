@@ -3,17 +3,31 @@ subir_a_firebase.py — corre en GitHub Actions, NO en el celular del usuario.
 
 Reutiliza scraper.py (el mismo que usa la app con Chaquopy, sin cambiarle
 nada) para escanear Steam/Epic/GOG y sube el resultado a Firebase
-Realtime Database, en /ofertas/{cc_code}. La app en Kotlin solo lee ese
-JSON ya armado (ver FirebaseOfertasRepo.kt), así que la carga es casi
-instantánea para el usuario.
+Realtime Database. Por cada moneda escribe TRES nodos, todos en una sola
+escritura atómica (o se guardan los tres o ninguno):
 
-Además de lo que devuelve el scraper, este script agrega a cada juego el
-campo "desde" (milisegundos): el momento en que se detectó su descuento
-actual. La pantalla de "Últimos descuentos" de la app se basa en él.
-    - juego nuevo en la lista, o cambió su %  -> desde = ahora
-    - mismo juego con el mismo %              -> se conserva el "desde" anterior
-    - primera corrida de una moneda (sin datos previos) -> desde = 0
-      ("ya estaba antes"), para no marcar cientos de juegos como novedad.
+  /ofertas/{cc}   La lista completa que muestra la pantalla principal de la app
+                  (actualizado, total, juegos). Pesa varios MB. Cada juego lleva
+                  además "desde": el momento en que se detectó su descuento actual.
+
+  /resumen/{cc}   Versión liviana que lee el Worker de notificaciones en segundo
+                  plano, para no bajar varios MB en cada revisión:
+                    meta     {firma, total, actualizado, version}
+                    control  unos pocos {link, id} para que la app compruebe, con
+                             datos reales, que calcula el MISMO id que este script
+                    gratis   solo los juegos con 100 % de descuento
+                    d        {id: {d: descuento, o: precio_orig, p: precio_final}}
+                             para que el Worker lea solo SUS favoritos
+                  "firma" cambia solo si cambia algún descuento; si es igual a la
+                  de la revisión anterior, el Worker ni siquiera descarga el resto.
+
+  /estado/{cc}    {id: "descuento|desde"}: memoria compacta de este script para
+                  calcular "desde" sin volver a bajar los MB de /ofertas.
+                  No la lee la app.
+
+IDENTIFICADOR DE JUEGO (id_juego): primeros 16 caracteres hexadecimales del
+SHA-1 del link en UTF-8. La app calcula lo mismo en IdJuego.kt. Si algún día se
+cambia aquí, hay que cambiarlo allá (y en los vectores de prueba).
 
 Variables de entorno que este script espera (las pone el workflow de
 GitHub Actions, ver escanear.yml):
@@ -24,6 +38,7 @@ Dependencias (ver requirements.txt):
     requests, beautifulsoup4, firebase-admin
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -65,33 +80,149 @@ MONEDAS_EN_PARALELO = 3
 # bloquearon: NO se sobrescribe lo que ya hay en Firebase.
 MINIMO_OFERTAS_VALIDAS = 1
 
+VERSION_RESUMEN = 1
 
-def _cargar_previos(ref):
-    """Devuelve {link: juego} con lo que ya está en Firebase para esa moneda.
+
+# --------------------------------------------------------------------
+# Identificador de juego (DEBE coincidir con IdJuego.kt en la app)
+# --------------------------------------------------------------------
+def id_juego(link):
+    """16 primeros caracteres hex (minúsculas) del SHA-1 del link codificado en UTF-8."""
+    return hashlib.sha1(link.encode("utf-8")).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------
+# Estado previo, para calcular "desde"
+# --------------------------------------------------------------------
+def _cargar_previos(cc_code):
+    """Devuelve {id: (descuento, desde_ms)} de la corrida anterior.
+    {} significa "primera corrida de esta moneda".
+
     Si Firebase falla, la excepción se propaga a propósito: es mejor no subir nada
     que subir con fechas 'desde' perdidas."""
-    previos = ref.child("juegos").get()
-    if isinstance(previos, dict):        # Firebase a veces devuelve listas como dict
-        previos = list(previos.values())
-    return {
-        j.get("link"): j
-        for j in (previos or [])
-        if isinstance(j, dict) and j.get("link")
-    }
+    estado = db.reference(f"/estado/{cc_code}").get()
+    if estado is not None:
+        if not isinstance(estado, dict):
+            raise RuntimeError(f"/estado/{cc_code} no tiene el formato esperado")
+        previos = {}
+        for jid, valor in estado.items():
+            try:
+                desc, desde = str(valor).split("|")
+                previos[jid] = (int(desc), int(desde))
+            except ValueError:
+                continue  # entrada corrupta: se ignora, no tumba la corrida
+        return previos
+
+    # Migración: todavía no existe /estado (primera corrida con este formato), pero
+    # puede haber una lista de la versión anterior. La aprovechamos una sola vez
+    # para no perder las fechas "desde" ya calculadas.
+    anteriores = db.reference(f"/ofertas/{cc_code}/juegos").get()
+    if isinstance(anteriores, dict):
+        anteriores = list(anteriores.values())
+    previos = {}
+    for j in anteriores or []:
+        if isinstance(j, dict) and j.get("link"):
+            previos[id_juego(j["link"])] = (int(j.get("desc") or 0), int(j.get("desde") or 0))
+    return previos
 
 
 def _asignar_desde(juegos, previos):
     ahora_ms = int(time.time() * 1000)
     for j in juegos:
-        anterior = previos.get(j.get("link"))
-        if anterior is not None and anterior.get("desc") == j.get("desc"):
-            j["desde"] = anterior.get("desde", 0)      # sin cambios: conserva la fecha
+        anterior = previos.get(id_juego(j.get("link", "")))
+        if anterior is not None and anterior[0] == int(j.get("desc") or 0):
+            j["desde"] = anterior[1]          # sin cambios: conserva la fecha
         elif not previos:
-            j["desde"] = 0                             # primera corrida: "ya estaba antes"
+            j["desde"] = 0                    # primera corrida: "ya estaba antes"
         else:
-            j["desde"] = ahora_ms                      # juego nuevo o cambió el porcentaje
+            j["desde"] = ahora_ms             # juego nuevo o cambió el porcentaje
 
 
+# --------------------------------------------------------------------
+# Resumen liviano + firma + estado
+# --------------------------------------------------------------------
+def _elegir_control(links):
+    """Elige unos pocos links de ejemplo para que la app verifique su cálculo de id
+    con datos reales: el primero, el más largo, y el que más caracteres no-ASCII tenga
+    (los que más fácil se calculan distinto si hubiera un problema de codificación)."""
+    if not links:
+        return []
+    elegidos = [links[0], max(links, key=len)]
+    no_ascii = [l for l in links if any(ord(c) > 127 for c in l)]
+    if no_ascii:
+        elegidos.append(max(no_ascii, key=lambda l: sum(ord(c) > 127 for c in l)))
+    return [{"link": l, "id": id_juego(l)} for l in dict.fromkeys(elegidos)]
+
+
+def construir_nodos(juegos, actualizado_iso):
+    """A partir de la lista final (con 'desde') arma los tres nodos de Firebase."""
+    d = {}
+    estado = {}
+    gratis = {}
+    ids = {}
+    links = []
+
+    for j in juegos:
+        link = j.get("link") or ""
+        if not link:
+            continue
+        jid = id_juego(link)
+        if jid in ids and ids[jid] != link:
+            # Dos links distintos con el mismo id de 64 bits: prácticamente imposible,
+            # pero si pasara, es mejor detener la corrida que confundir favoritos.
+            raise RuntimeError(f"colisión de id_juego entre {ids[jid]!r} y {link!r}")
+        if jid not in ids:
+            links.append(link)
+        ids[jid] = link
+
+        desc = int(j.get("desc") or 0)
+        d[jid] = {"d": desc, "o": j.get("p_orig") or "", "p": j.get("p_final") or ""}
+        estado[jid] = f"{desc}|{int(j.get('desde') or 0)}"
+
+        # Mismo criterio que el Worker anterior: desc >= 100 y sin repetir link
+        # (se queda con la primera aparición).
+        if desc >= 100 and link not in gratis:
+            gratis[link] = {
+                "nombre": j.get("nombre") or "Desconocido",
+                "link": link,
+                "tienda": j.get("tienda") or "Steam",
+                "tipo": j.get("tipo") or "Juego",
+                "desc": desc,
+                "p_orig": j.get("p_orig") or "",
+                "p_final": j.get("p_final") or "",
+            }
+
+    # La firma depende SOLO de lo que decide si hay que avisar: qué juegos hay y con
+    # qué descuento (los gratis son los de desc >= 100). Cambios de precio sin cambio
+    # de porcentaje no la alteran.
+    firma = hashlib.sha1(
+        "\n".join(sorted(f"{k}:{v['d']}" for k, v in d.items())).encode("utf-8")
+    ).hexdigest()[:16]
+
+    return {
+        "ofertas": {
+            "actualizado": actualizado_iso,
+            "total": len(juegos),
+            "juegos": juegos,
+        },
+        "resumen": {
+            "meta": {
+                "firma": firma,
+                "total": len(d),
+                "actualizado": actualizado_iso,
+                "version": VERSION_RESUMEN,
+            },
+            "control": _elegir_control(links),
+            "gratis": list(gratis.values()),
+            "d": d,
+        },
+        "estado": estado,
+    }
+
+
+# --------------------------------------------------------------------
+# Una moneda
+# --------------------------------------------------------------------
 def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     print(f"[{cc_code}] escaneando Steam + Epic + GOG...")
     json_texto = scraper.get_game_deals(
@@ -107,14 +238,16 @@ def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     if len(juegos) < MINIMO_OFERTAS_VALIDAS:
         raise RuntimeError("el scraper devolvió 0 ofertas; se conserva lo anterior en Firebase")
 
-    ref = db.reference(f"/ofertas/{cc_code}")
-    _asignar_desde(juegos, _cargar_previos(ref))
+    _asignar_desde(juegos, _cargar_previos(cc_code))
+    nodos = construir_nodos(juegos, datetime.now(timezone.utc).isoformat())
 
     print(f"[{cc_code}] {len(juegos)} ofertas encontradas, subiendo a Firebase...")
-    ref.set({
-        "actualizado": datetime.now(timezone.utc).isoformat(),
-        "total": len(juegos),
-        "juegos": juegos,
+    # Una sola escritura atómica en tres rutas: o se guardan las tres o ninguna, así
+    # /resumen y /estado nunca quedan desfasados respecto a /ofertas.
+    db.reference("/").update({
+        f"ofertas/{cc_code}": nodos["ofertas"],
+        f"resumen/{cc_code}": nodos["resumen"],
+        f"estado/{cc_code}": nodos["estado"],
     })
     print(f"[{cc_code}] listo.")
 
