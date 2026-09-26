@@ -1,0 +1,63 @@
+# Este archivo va en: .github/workflows/escanear.yml (dentro del repo del backend)
+#
+# Corre subir_a_firebase.py automáticamente cada 4 horas (hora UTC) y
+# también se puede lanzar a mano desde la pestaña "Actions" de GitHub
+# con el botón "Run workflow" (gracias a workflow_dispatch).
+#
+# Con las 10 monedas escaneadas en grupos de 3 en paralelo, un run
+# completo tarda entre 8 y 15 minutos aprox. A 4 corridas al día, esto usa
+# entre ~30 y ~60 minutos de los 2000 minutos/mes gratis de GitHub Actions.
+#
+# ⚠️ GitHub DESACTIVA los workflows programados de un repo PÚBLICO después de
+# 60 días sin actividad (commits, etc.). Si un día dejan de actualizarse las
+# ofertas, entra a Actions y reactívalo, o haz un commit pequeño cada ~2 meses.
+# (En repos privados esta regla no aplica.)
+
+name: Escanear ofertas y subir a Firebase
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # cada 4 horas — la hora es UTC, no la de Colombia
+  workflow_dispatch: {}
+
+# El workflow solo necesita leer el repo.
+permissions:
+  contents: read
+
+# Si una corrida se alarga y empieza la siguiente, no las dejes pisarse.
+concurrency:
+  group: escanear-ofertas
+  cancel-in-progress: false
+
+jobs:
+  escanear:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Descargar el repo
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Escribir la clave de servicio de Firebase (desde el secreto)
+        env:
+          FIREBASE_SA_B64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_B64 }}
+        run: echo "$FIREBASE_SA_B64" | base64 -d > firebase-key.json
+
+      - name: Escanear y subir a Firebase
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: firebase-key.json
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+        run: python subir_a_firebase.py
+
+      - name: Borrar la clave (no debe quedar en los logs ni en el runner)
+        if: always()
+        run: rm -f firebase-key.json
