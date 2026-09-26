@@ -269,11 +269,23 @@ def _detalle_steam(appid, idioma, cc_code):
         "metacritic_score": None, "metacritic_url": None,
         "imagen": None, "controles": None,
     }
+    # Sin estas cookies, la API de Steam responde {"success": false} (sin
+    # nombre, descripción, fecha, desarrollador ni editor) para juegos con
+    # aviso de contenido maduro (p.ej. Watch_Dogs 2), aunque el appid sea
+    # correcto y válido. Con esto le decimos a Steam que ya "verificamos"
+    # que somos mayores de edad, igual que hace el navegador al aceptar
+    # el aviso de la ficha del juego.
+    cookies_edad = {
+        "birthtime": "470682000",  # cualquier fecha que dé +18 años
+        "lastagecheckage": "1-January-1990",
+        "wants_mature_content": "1",
+    }
+
     try:
         res = requests.get(
             "https://store.steampowered.com/api/appdetails",
             params={"appids": appid, "l": l, "cc": cc_code},
-            headers=HEADERS_BASE, timeout=10,
+            headers=HEADERS_BASE, cookies=cookies_edad, timeout=10,
         )
         res.raise_for_status()
         entrada = res.json().get(str(appid), {})
