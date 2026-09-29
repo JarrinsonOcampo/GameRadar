@@ -31,6 +31,11 @@ STEAM_MAX_ITEMS = 5000
 EPIC_MAX_PAGINAS = 20     # 100 productos por página
 GOG_MAX_PAGINAS = 150     # 48 productos por página (Suficiente para cubrir todo el catálogo)
 
+# Steam limita las peticiones por IP (sobre todo desde GitHub Actions, que usa IPs
+# de datacenter compartidas). Estas dos constantes controlan cuánto se le insiste.
+STEAM_PAUSA_ENTRE_PAGINAS = 1.0   # segundos entre página y página (bájalo a 0 si solo corre en el celular)
+STEAM_REINTENTOS = 4              # intentos por petición ante 403/429/503 o error de red
+
 GOG_MONEDAS_VALIDAS = {
     "USD", "EUR", "GBP", "AUD", "CAD", "CHF", "PLN",
     "RUB", "NOK", "SEK", "DKK", "JPY", "CNY", "BRL", "ZAR",
@@ -132,7 +137,46 @@ def _steam_img_url(link):
 # ---------------------------------------------------------------------
 # STEAM
 # ---------------------------------------------------------------------
+def _steam_json(url, headers, etiqueta):
+    """
+    GET a Steam que devuelve el JSON o None. Ante 403/429/503 o errores de red
+    espera y reintenta (espera 20s, 40s, 80s...). Todo fallo queda en el log
+    (antes se ignoraban en silencio y la lista de Steam salía vacía).
+    """
+    espera = 20
+    for intento in range(1, STEAM_REINTENTOS + 1):
+        try:
+            res = requests.get(url, headers=headers, timeout=20)
+        except Exception as e:
+            _log(f"steam {etiqueta} (red, intento {intento})", e)
+            time.sleep(5)
+            continue
+
+        if res.status_code in (403, 429, 503):
+            print(f"[scraper] steam {etiqueta}: HTTP {res.status_code} "
+                  f"(intento {intento}/{STEAM_REINTENTOS}), reintento en {espera}s")
+            time.sleep(espera)
+            espera *= 2
+            continue
+
+        if res.status_code != 200:
+            print(f"[scraper] steam {etiqueta}: HTTP {res.status_code} url={url}")
+            return None
+
+        try:
+            return res.json()
+        except ValueError:
+            print(f"[scraper] steam {etiqueta}: la respuesta no es JSON "
+                  f"({res.headers.get('Content-Type')}): {res.text[:200]!r}")
+            return None
+
+    print(f"[scraper] steam {etiqueta}: se agotaron los reintentos")
+    return None
+
+
 def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
+    cc_code = (cc_code or "").strip().lower()
+    print(f"[scraper] steam: cc_code={cc_code!r}")
     resultados = []
     vistos = set()
     headers = dict(HEADERS_BASE, **{"Accept-Language": "es-ES,es;q=0.9"})
@@ -143,10 +187,10 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
     ]
     for url in urls_gratis:
         try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code != 200:
+            datos = _steam_json(url, headers, "gratis")
+            if datos is None:
                 continue
-            soup = BeautifulSoup(res.json().get("results_html", ""), "html.parser")
+            soup = BeautifulSoup(datos.get("results_html", ""), "html.parser")
             for juego in soup.find_all("a", class_="search_result_row"):
                 link = juego.get("href", "").split("?")[0]
                 if not link or link in vistos:
@@ -194,19 +238,20 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
                         "ref_id": _extraer_appid_steam(link) or "",
                     })
                     vistos.add(link)
-        except Exception:
-            pass
+        except Exception as e:
+            _log("steam gratis", e)
 
     start = 0
     while start < STEAM_MAX_ITEMS:
         url = (f"https://store.steampowered.com/search/results/?query&start={start}"
                f"&count=50&specials=1&cc={cc_code}&l=spanish&infinite=1")
         try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code != 200:
+            datos = _steam_json(url, headers, f"página start={start}")
+            if datos is None:
                 break
-            html = res.json().get("results_html", "")
+            html = datos.get("results_html", "")
             if not html.strip():
+                print(f"[scraper] steam: results_html vacío en start={start} (fin de resultados)")
                 break
 
             soup = BeautifulSoup(html, "html.parser")
@@ -247,9 +292,12 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
                 vistos.add(link)
 
             start += 50
-        except Exception:
+            time.sleep(STEAM_PAUSA_ENTRE_PAGINAS)
+        except Exception as e:
+            _log(f"steam página start={start}", e)
             break
 
+    print(f"[scraper] steam: {len(resultados)} resultados para cc={cc_code}")
     return resultados
 
 

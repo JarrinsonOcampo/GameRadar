@@ -74,7 +74,10 @@ MONEDAS = [
 # Cuántas monedas se escanean AL MISMO TIEMPO. Subir este número acelera
 # el job, pero golpea Steam/Epic/GOG con más peticiones simultáneas y
 # aumenta el riesgo de que te empiecen a bloquear (rate limiting).
-MONEDAS_EN_PARALELO = 3
+# Con 1 se escanea una moneda a la vez: es lo más seguro contra el bloqueo de
+# Steam (que es lo que dejaba vacías las ofertas de Steam en varias monedas).
+# Si ves que los logs ya no muestran HTTP 429, puedes probar con 2.
+MONEDAS_EN_PARALELO = 1
 
 # Si el scraper devuelve menos de esto, casi seguro una tienda falló o nos
 # bloquearon: NO se sobrescribe lo que ya hay en Firebase.
@@ -268,6 +271,12 @@ def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
 
     if len(juegos) < MINIMO_OFERTAS_VALIDAS:
         raise RuntimeError("el scraper devolvió 0 ofertas; se conserva lo anterior en Firebase")
+
+    # Epic y GOG pueden responder bien aunque Steam nos haya bloqueado. Sin esta
+    # comprobación se subiría la moneda SIN Steam y se pisarían los datos buenos.
+    if not any(j.get("tienda") == "Steam" for j in juegos):
+        raise RuntimeError("Steam devolvió 0 ofertas (¿límite de peticiones?); "
+                           "se conserva lo anterior en Firebase")
 
     _asignar_desde_resultado = _asignar_desde(juegos, _cargar_previos(cc_code))
     nodos = construir_nodos(juegos, datetime.now(timezone.utc).isoformat(), _asignar_desde_resultado)

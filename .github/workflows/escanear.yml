@@ -4,9 +4,11 @@
 # también se puede lanzar a mano desde la pestaña "Actions" de GitHub
 # con el botón "Run workflow" (gracias a workflow_dispatch).
 #
-# Con las 10 monedas escaneadas en grupos de 3 en paralelo, un run
-# completo tarda entre 8 y 15 minutos aprox. A 4 corridas al día, esto usa
-# entre ~30 y ~60 minutos de los 2000 minutos/mes gratis de GitHub Actions.
+# Las 10 monedas se escanean UNA A LA VEZ (con pausas entre páginas) para no
+# ser bloqueados por Steam. Un run completo tarda ~30-45 minutos.
+#
+# En un repo PÚBLICO los minutos de GitHub Actions son ilimitados. En uno
+# PRIVADO son 2000/mes: con este ritmo (4 runs/día) no alcanzarían.
 #
 # ⚠️ GitHub DESACTIVA los workflows programados de un repo PÚBLICO después de
 # 60 días sin actividad (commits, etc.). Si un día dejan de actualizarse las
@@ -17,7 +19,7 @@ name: Escanear ofertas y subir a Firebase
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # cada 4 horas — la hora es UTC, no la de Colombia
+    - cron: "0 */6 * * *"   # cada 6 horas — la hora es UTC, no la de Colombia
   workflow_dispatch: {}
 
 # El workflow solo necesita leer el repo.
@@ -32,7 +34,7 @@ concurrency:
 jobs:
   escanear:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Descargar el repo
