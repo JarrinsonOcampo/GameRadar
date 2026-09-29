@@ -85,6 +85,11 @@ MINIMO_OFERTAS_VALIDAS = 1
 
 VERSION_RESUMEN = 2
 
+# Pausa (segundos) entre una moneda y la siguiente, para que Steam "enfríe" la IP
+# del runner. Sin esto, cuando Steam bloquea una moneda, la siguiente arranca ya
+# bloqueada y falla o sube incompleta.
+PAUSA_ENTRE_MONEDAS = 60
+
 # Un juego con este % de descuento o más cuenta para "grandes_total" en el resumen
 # diario (p. ej. "45 juegos con más de 50% de descuento hoy").
 DESCUENTO_GRANDE = 50
@@ -257,7 +262,7 @@ def construir_nodos(juegos, actualizado_iso, novedades):
 # --------------------------------------------------------------------
 # Una moneda
 # --------------------------------------------------------------------
-def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
+def _escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     print(f"[{cc_code}] escaneando Steam + Epic + GOG...")
     json_texto = scraper.get_game_deals(
         cc_code=cc_code,
@@ -290,6 +295,14 @@ def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
         f"estado/{cc_code}": nodos["estado"],
     })
     print(f"[{cc_code}] listo.")
+
+
+def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
+    """Escanea una moneda y, pase lo que pase, espera antes de la siguiente."""
+    try:
+        _escanear_y_subir(cc_code, symbol, no_decimals, gog_currency)
+    finally:
+        time.sleep(PAUSA_ENTRE_MONEDAS)
 
 
 def main():

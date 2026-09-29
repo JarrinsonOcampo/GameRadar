@@ -166,9 +166,13 @@ def _steam_json(url, headers, etiqueta):
         try:
             return res.json()
         except ValueError:
-            print(f"[scraper] steam {etiqueta}: la respuesta no es JSON "
-                  f"({res.headers.get('Content-Type')}): {res.text[:200]!r}")
-            return None
+            # Steam a veces responde 200 con una página HTML (bloqueo suave) en vez
+            # de JSON. Es lo mismo que un 429: hay que esperar y reintentar, no rendirse.
+            print(f"[scraper] steam {etiqueta}: HTML en vez de JSON "
+                  f"(intento {intento}/{STEAM_REINTENTOS}), reintento en {espera}s")
+            time.sleep(espera)
+            espera *= 2
+            continue
 
     print(f"[scraper] steam {etiqueta}: se agotaron los reintentos")
     return None
