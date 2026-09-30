@@ -35,6 +35,12 @@ GOG_MAX_PAGINAS = 150     # 48 productos por página (Suficiente para cubrir tod
 # de datacenter compartidas). Estas dos constantes controlan cuánto se le insiste.
 STEAM_PAUSA_ENTRE_PAGINAS = 1.0   # segundos entre página y página (bájalo a 0 si solo corre en el celular)
 STEAM_REINTENTOS = 4              # intentos por petición ante 403/429/503 o error de red
+STEAM_REINTENTOS_HTML = 3         # intentos si Steam responde HTML en vez de JSON (esperas de 30s y 60s)
+
+# Lo pone _escanear_steam en True cuando la lista de Steam quedó CORTADA por un bloqueo o
+# error (no porque se acabaran los resultados). subir_a_firebase.py lo lee para no
+# pisar datos buenos con una lista a medias.
+STEAM_INCOMPLETO = False
 
 GOG_MONEDAS_VALIDAS = {
     "USD", "EUR", "GBP", "AUD", "CAD", "CHF", "PLN",
@@ -115,6 +121,36 @@ def _fmt(valor, symbol, no_decimals):
     return f"{symbol} {valor:,.2f}"
 
 
+# Epic devuelve, junto a cada precio, el código de la moneda REAL en que cobra en ese país
+# (Epic acepta 43 monedas: entre las latinoamericanas están COP, CLP, PEN, MXN, BRL y UYU;
+# NO hay peso argentino, y los países sin moneda propia pagan en USD). Antes se usaba
+# siempre el símbolo configurado en la app, así que si Epic cobraba en otra moneda el número
+# salía bien pero con la etiqueta equivocada. Ahora se usa la moneda que Epic dice.
+_ISO_DE_SIMBOLO = {
+    "COL$": "COP", "$": "USD", "US$": "USD", "\u20ac": "EUR", "MEX$": "MXN", "ARS$": "ARS",
+    "CLP$": "CLP", "S/": "PEN", "R$": "BRL", "\u00a3": "GBP", "CDN$": "CAD",
+    "$U": "UYU", "\u20a1": "CRC",
+}
+_SIMBOLO_DE_ISO = {
+    "USD": ("US$", False), "COP": ("COL$", True), "CLP": ("CLP$", True),
+    "PEN": ("S/", False), "MXN": ("MEX$", False), "BRL": ("R$", False),
+    "GBP": ("\u00a3", False), "CAD": ("CDN$", False), "EUR": ("\u20ac", False),
+    "UYU": ("$U", True), "CRC": ("\u20a1", True), "CSC": ("\u20a1", True),
+    "ARS": ("ARS$", True),
+}
+
+
+def _moneda_epic(iso, symbol, no_decimals):
+    """(símbolo, sin_decimales) a usar para un precio de Epic según la moneda que Epic devolvió.
+    Si Epic no la informa, o coincide con la configurada, se respeta la configuración."""
+    iso = (iso or "").strip().upper()
+    if not iso or _ISO_DE_SIMBOLO.get(symbol) == iso:
+        return symbol, no_decimals
+    if iso in _SIMBOLO_DE_ISO:
+        return _SIMBOLO_DE_ISO[iso]
+    return iso, False
+
+
 def _extraer_appid_steam(link):
     try:
         partes = link.rstrip("/").split("/")
@@ -144,6 +180,8 @@ def _steam_json(url, headers, etiqueta):
     (antes se ignoraban en silencio y la lista de Steam salía vacía).
     """
     espera = 20
+    espera_html = 30
+    intento_html = 1
     for intento in range(1, STEAM_REINTENTOS + 1):
         try:
             res = requests.get(url, headers=headers, timeout=20)
@@ -167,11 +205,17 @@ def _steam_json(url, headers, etiqueta):
             return res.json()
         except ValueError:
             # Steam a veces responde 200 con una página HTML (bloqueo suave) en vez
-            # de JSON. Es lo mismo que un 429: hay que esperar y reintentar, no rendirse.
+            # de JSON. Se reintenta un par de veces con espera corta y, si sigue
+            # igual, se da por bloqueado: esperar más solo alarga el trabajo sin arreglar nada.
+            if intento_html >= STEAM_REINTENTOS_HTML:
+                print(f"[scraper] steam {etiqueta}: HTML en vez de JSON "
+                      f"(intento {intento_html}/{STEAM_REINTENTOS_HTML}), se abandona")
+                return None
             print(f"[scraper] steam {etiqueta}: HTML en vez de JSON "
-                  f"(intento {intento}/{STEAM_REINTENTOS}), reintento en {espera}s")
-            time.sleep(espera)
-            espera *= 2
+                  f"(intento {intento_html}/{STEAM_REINTENTOS_HTML}), reintento en {espera_html}s")
+            time.sleep(espera_html)
+            espera_html *= 2
+            intento_html += 1
             continue
 
     print(f"[scraper] steam {etiqueta}: se agotaron los reintentos")
@@ -179,6 +223,8 @@ def _steam_json(url, headers, etiqueta):
 
 
 def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
+    global STEAM_INCOMPLETO
+    STEAM_INCOMPLETO = False
     cc_code = (cc_code or "").strip().lower()
     print(f"[scraper] steam: cc_code={cc_code!r}")
     resultados = []
@@ -189,10 +235,12 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
         f"https://store.steampowered.com/search/results/?query&maxprice=free&specials=1&cc={cc_code}&l=spanish&infinite=1",
         f"https://store.steampowered.com/search/results/?term=100%25&specials=1&cc={cc_code}&l=spanish&infinite=1",
     ]
+    fallos_gratis = 0
     for url in urls_gratis:
         try:
             datos = _steam_json(url, headers, "gratis")
             if datos is None:
+                fallos_gratis += 1
                 continue
             soup = BeautifulSoup(datos.get("results_html", ""), "html.parser")
             for juego in soup.find_all("a", class_="search_result_row"):
@@ -245,6 +293,13 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
         except Exception as e:
             _log("steam gratis", e)
 
+    if fallos_gratis >= len(urls_gratis):
+        # Las dos peticiones fallaron: Steam nos tiene bloqueados. Seguir con las ~100
+        # páginas solo gastaría minutos; se abandona esta moneda de una vez.
+        print(f"[scraper] steam: bloqueado (fallaron las listas de gratis), se abandona cc={cc_code}")
+        STEAM_INCOMPLETO = True
+        return resultados
+
     start = 0
     while start < STEAM_MAX_ITEMS:
         url = (f"https://store.steampowered.com/search/results/?query&start={start}"
@@ -252,6 +307,7 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
         try:
             datos = _steam_json(url, headers, f"página start={start}")
             if datos is None:
+                STEAM_INCOMPLETO = True
                 break
             html = datos.get("results_html", "")
             if not html.strip():
@@ -299,6 +355,7 @@ def _escanear_steam(cc_code, symbol, no_decimals, free_badge):
             time.sleep(STEAM_PAUSA_ENTRE_PAGINAS)
         except Exception as e:
             _log(f"steam página start={start}", e)
+            STEAM_INCOMPLETO = True
             break
 
     print(f"[scraper] steam: {len(resultados)} resultados para cc={cc_code}")
@@ -475,6 +532,7 @@ def _epic_guardar_cache(slug, item):
 def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
     resultados = []
     slugs = set()
+    monedas_epic = set()   # monedas que Epic devolvió en este escaneo (para el log)
     pais = cc_code.upper()
     headers = dict(HEADERS_BASE, **{
         "Accept": "application/json, text/plain, */*",
@@ -495,6 +553,10 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
             precio = ((item.get("price") or {}).get("totalPrice") or {})
             base = (precio.get("originalPrice") or 0) / 100
             final = (precio.get("discountPrice") or 0) / 100
+            iso_epic = precio.get("currencyCode")
+            if iso_epic:
+                monedas_epic.add(str(iso_epic).upper())
+            sym_i, nd_i = _moneda_epic(iso_epic, symbol, no_decimals)
 
             gratis = _epic_es_gratis(item) or (final == 0 and base > 0)
             if not gratis or base <= 0:
@@ -510,7 +572,7 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
             resultados.append({
                 "nombre": item.get("title", "Juego Epic"),
                 "desc": 100,
-                "p_orig": _fmt(base, symbol, no_decimals),
+                "p_orig": _fmt(base, sym_i, nd_i),
                 "p_final": free_badge,
                 "tipo": _epic_tipo(item),
                 "link": link,
@@ -521,7 +583,7 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
     except Exception as e:
         _log("epic gratis", e)
 
-    query = """
+    query_base = """
     query searchStoreQuery($count: Int, $start: Int, $country: String!, $locale: String!) {
       Catalog {
         searchStore(count: $count, start: $start, country: $country, locale: $locale, onSale: true) {
@@ -534,12 +596,16 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
             keyImages { type url }
             catalogNs { mappings(pageType: "productHome") { pageSlug } }
             offerMappings { pageSlug }
-            price(country: $country) { totalPrice { originalPrice discountPrice } }
+            price(country: $country) { totalPrice { originalPrice discountPrice __CURRENCY__ } }
           }
         }
       }
     }
     """
+    # Primero se pide también "currencyCode". Si Epic rechazara ese campo, se vuelve a la
+    # consulta de siempre (sin él) para no perder el catálogo de Epic.
+    query = query_base.replace("__CURRENCY__", "currencyCode")
+    query_sin_moneda = query_base.replace("__CURRENCY__", "")
     por_pagina = 100
     total = None
 
@@ -556,8 +622,24 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
         try:
             res = requests.post("https://store.epicgames.com/graphql",
                                 json=payload, headers=headers, timeout=15)
+            try:
+                cuerpo_epic = res.json()
+            except ValueError:
+                cuerpo_epic = {}
+            rechazada = ((res.status_code >= 400 or cuerpo_epic.get("errors"))
+                         and not (cuerpo_epic.get("data") or {}).get("Catalog"))
+            if rechazada and query is not query_sin_moneda:
+                # Epic no aceptó el campo currencyCode: se repite ESTA misma página con la
+                # consulta de siempre y se sigue con ella hasta el final.
+                print("[scraper] epic: la consulta con currencyCode fue rechazada; "
+                      "se usa la consulta sin moneda")
+                query = query_sin_moneda
+                payload["query"] = query
+                res = requests.post("https://store.epicgames.com/graphql",
+                                    json=payload, headers=headers, timeout=15)
+                cuerpo_epic = res.json()
             res.raise_for_status()
-            tienda = res.json().get("data", {}).get("Catalog", {}).get("searchStore", {})
+            tienda = (cuerpo_epic.get("data") or {}).get("Catalog", {}).get("searchStore", {}) or {}
         except Exception as e:
             _log("epic catálogo", e)
             break
@@ -576,6 +658,10 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
             precio = ((item.get("price") or {}).get("totalPrice") or {})
             base = (precio.get("originalPrice") or 0) / 100
             final = (precio.get("discountPrice") or 0) / 100
+            iso_epic = precio.get("currencyCode")
+            if iso_epic:
+                monedas_epic.add(str(iso_epic).upper())
+            sym_i, nd_i = _moneda_epic(iso_epic, symbol, no_decimals)
             if base <= 0 or final >= base:
                 continue
 
@@ -588,8 +674,8 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
             resultados.append({
                 "nombre": item.get("title", "Juego Epic"),
                 "desc": pct,
-                "p_orig": _fmt(base, symbol, no_decimals),
-                "p_final": _fmt(final, symbol, no_decimals),
+                "p_orig": _fmt(base, sym_i, nd_i),
+                "p_final": _fmt(final, sym_i, nd_i),
                 "tipo": _epic_tipo(item),
                 "link": link,
                 "tienda": "Epic Games",
@@ -599,6 +685,8 @@ def _escanear_epic(cc_code, symbol, no_decimals, free_badge):
 
         time.sleep(0.15)
 
+    print(f"[scraper] epic {pais}: {len(resultados)} ofertas; moneda(s) que devolvió Epic: "
+          f"{sorted(monedas_epic) or 'no informó'}")
     return resultados
 
 

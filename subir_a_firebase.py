@@ -38,11 +38,13 @@ Dependencias (ver requirements.txt):
     requests, beautifulsoup4, firebase-admin
 """
 
+import copy
 import hashlib
 import json
 import os
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -63,12 +65,23 @@ MONEDAS = [
     ("us", "$", False, "USD"),      # Estados Unidos
     ("es", "€", False, "EUR"),      # España / Eurozona
     ("mx", "MEX$", False, "USD"),   # México
-    ("ar", "ARS$", True, "USD"),    # Argentina
+    ("ar", "US$", False, "USD"),    # Argentina (Steam, Epic y GOG ya cobran en USD ahí)
     ("cl", "CLP$", True, "USD"),    # Chile
     ("pe", "S/", False, "USD"),     # Perú
     ("br", "R$", False, "BRL"),     # Brasil
     ("gb", "£", False, "GBP"),      # Reino Unido
     ("ca", "CDN$", False, "CAD"),   # Canadá
+    # Steam los agrupa en la región "Latinoamérica USD" (precios en dólares, distintos a los de EE. UU.)
+    ("bo", "US$", False, "USD"),    # Bolivia
+    ("ec", "US$", False, "USD"),    # Ecuador
+    ("py", "US$", False, "USD"),    # Paraguay
+    ("ve", "US$", False, "USD"),    # Venezuela
+    ("sv", "US$", False, "USD"),    # El Salvador
+    ("pa", "US$", False, "USD"),    # Panamá
+    ("ni", "US$", False, "USD"),    # Nicaragua
+    # Steam tiene moneda propia en estos dos
+    ("uy", "$U", True, "USD"),      # Uruguay
+    ("cr", "₡", True, "USD"),       # Costa Rica
 ]
 
 # Cuántas monedas se escanean AL MISMO TIEMPO. Subir este número acelera
@@ -89,6 +102,30 @@ VERSION_RESUMEN = 2
 # del runner. Sin esto, cuando Steam bloquea una moneda, la siguiente arranca ya
 # bloqueada y falla o sube incompleta.
 PAUSA_ENTRE_MONEDAS = 60
+
+# Pausa entre páginas de Steam SOLO en el backend (la app sigue usando la de scraper.py).
+# Steam empezaba a dar 429 cada ~30 páginas y, si se insiste, pasa a bloqueo suave (HTML).
+# Ir un poco más lento evita llegar a ese punto.
+PAUSA_STEAM_ENTRE_PAGINAS = 2.0
+scraper.STEAM_PAUSA_ENTRE_PAGINAS = PAUSA_STEAM_ENTRE_PAGINAS
+
+# Si una moneda falla (bloqueo), se espera esto y se reintenta UNA vez al final del job.
+PAUSA_ANTES_DE_REINTENTAR = 300
+
+# Steam da el MISMO precio a todos los países de su región "Latinoamérica USD"
+# (Argentina, Bolivia, Ecuador, Paraguay, Venezuela, El Salvador, Panamá, Nicaragua, ...): el precio
+# lo fija el desarrollador por región, no por país. En vez de escanear Steam 7 veces
+# (700 peticiones, y Steam es la tienda que bloquea), se escanea UNA vez con "pa" y esa
+# lista de STEAM se reutiliza en los demás países.
+# Epic y GOG NO se comparten: son livianas y sí se consultan con el código de cada país,
+# por si alguna de las dos tiene precios distintos por país.
+# Cada país conserva su propio "desde" y su propio resumen.
+# Formato: {país que se escanea: [países que reciben la lista de Steam]}
+COPIAS = {
+    "pa": ["ar", "bo", "ec", "py", "ve", "sv", "ni"],
+}
+_DESTINOS_DE_COPIA = {d for destinos in COPIAS.values() for d in destinos}
+_CONFIG_MONEDA = {m[0]: m for m in MONEDAS}
 
 # Un juego con este % de descuento o más cuenta para "grandes_total" en el resumen
 # diario (p. ej. "45 juegos con más de 50% de descuento hoy").
@@ -262,6 +299,32 @@ def construir_nodos(juegos, actualizado_iso, novedades):
 # --------------------------------------------------------------------
 # Una moneda
 # --------------------------------------------------------------------
+def _publicar(cc_code, juegos, steam_incompleto):
+    """Calcula 'desde' y los tres nodos de ESTE país y los sube a Firebase."""
+    previos = _cargar_previos(cc_code)
+    if steam_incompleto:
+        if previos:
+            # Steam nos cortó a mitad de camino: subir esto dejaría la moneda con muchos
+            # menos juegos que antes. Se conserva lo que ya hay.
+            raise RuntimeError("la lista de Steam quedó incompleta (bloqueo); "
+                               "se conserva lo anterior en Firebase")
+        print(f"[{cc_code}] AVISO: Steam quedó incompleto, pero es la primera vez de esta "
+              f"moneda: se sube igual y se completa en la próxima corrida")
+
+    novedades = _asignar_desde(juegos, previos)
+    nodos = construir_nodos(juegos, datetime.now(timezone.utc).isoformat(), novedades)
+
+    print(f"[{cc_code}] {len(juegos)} ofertas, subiendo a Firebase...")
+    # Una sola escritura atómica en tres rutas: o se guardan las tres o ninguna, así
+    # /resumen y /estado nunca quedan desfasados respecto a /ofertas.
+    db.reference("/").update({
+        f"ofertas/{cc_code}": nodos["ofertas"],
+        f"resumen/{cc_code}": nodos["resumen"],
+        f"estado/{cc_code}": nodos["estado"],
+    })
+    print(f"[{cc_code}] listo.")
+
+
 def _escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
     print(f"[{cc_code}] escaneando Steam + Epic + GOG...")
     json_texto = scraper.get_game_deals(
@@ -273,6 +336,7 @@ def _escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
         tiendas="steam,epic,gog",
     )
     juegos = json.loads(json_texto)
+    steam_incompleto = scraper.STEAM_INCOMPLETO
 
     if len(juegos) < MINIMO_OFERTAS_VALIDAS:
         raise RuntimeError("el scraper devolvió 0 ofertas; se conserva lo anterior en Firebase")
@@ -283,18 +347,36 @@ def _escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
         raise RuntimeError("Steam devolvió 0 ofertas (¿límite de peticiones?); "
                            "se conserva lo anterior en Firebase")
 
-    _asignar_desde_resultado = _asignar_desde(juegos, _cargar_previos(cc_code))
-    nodos = construir_nodos(juegos, datetime.now(timezone.utc).isoformat(), _asignar_desde_resultado)
+    print(f"[{cc_code}] por tienda: {dict(Counter(j.get('tienda') for j in juegos))}")
 
-    print(f"[{cc_code}] {len(juegos)} ofertas encontradas, subiendo a Firebase...")
-    # Una sola escritura atómica en tres rutas: o se guardan las tres o ninguna, así
-    # /resumen y /estado nunca quedan desfasados respecto a /ofertas.
-    db.reference("/").update({
-        f"ofertas/{cc_code}": nodos["ofertas"],
-        f"resumen/{cc_code}": nodos["resumen"],
-        f"estado/{cc_code}": nodos["estado"],
-    })
-    print(f"[{cc_code}] listo.")
+    _publicar(cc_code, juegos, steam_incompleto)
+
+    # Países que comparten la lista de Steam de este (ver COPIAS). De Steam se reutiliza lo
+    # ya escaneado; Epic y GOG se consultan con el código de cada país. Cada país recibe su
+    # propia copia porque _asignar_desde modifica los juegos.
+    fallaron = []
+    for destino in COPIAS.get(cc_code, []):
+        try:
+            _, sym_d, no_dec_d, gog_d = _CONFIG_MONEDA[destino]
+            print(f"[{destino}] Steam: misma lista de [{cc_code}]; escaneando Epic + GOG propios...")
+            steam_d = [j for j in juegos if j.get("tienda") == "Steam"]
+            epic_gog_d = json.loads(scraper.get_game_deals(
+                cc_code=destino, symbol=sym_d, no_decimals=no_dec_d,
+                gog_currency=gog_d, free_badge=FREE_BADGE, tiendas="epic,gog",
+            ))
+            if not epic_gog_d:
+                # Epic y GOG fallaron para este país: mejor usar los del país base que dejarlo sin ellas.
+                print(f"[{destino}] AVISO: Epic/GOG no respondieron; se usan los de [{cc_code}]")
+                epic_gog_d = [j for j in juegos if j.get("tienda") != "Steam"]
+            lista_d = copy.deepcopy(steam_d) + copy.deepcopy(epic_gog_d)
+            lista_d.sort(key=lambda j: int(j.get("desc") or 0), reverse=True)
+            print(f"[{destino}] por tienda: {dict(Counter(j.get('tienda') for j in lista_d))}")
+            _publicar(destino, lista_d, steam_incompleto)
+        except Exception as e:
+            print(f"[{destino}] ERROR: {type(e).__name__}: {e}")
+            fallaron.append(destino)
+    if fallaron:
+        raise RuntimeError(f"no se pudo publicar la copia para: {', '.join(fallaron)}")
 
 
 def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
@@ -305,17 +387,28 @@ def escanear_y_subir(cc_code, symbol, no_decimals, gog_currency):
         time.sleep(PAUSA_ENTRE_MONEDAS)
 
 
-def main():
-    cred = credentials.Certificate(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": os.environ["FIREBASE_DATABASE_URL"],
-    })
+def _monedas_a_escanear():
+    """Si el workflow define MONEDAS_A_ESCANEAR (ej. "co,us,es"), solo se escanean esas.
+    Así cada job del matrix de GitHub Actions se encarga de un grupo y corren en paralelo,
+    cada uno con su propia IP (Steam bloquea mucho menos). Sin la variable: todas."""
+    filtro = os.environ.get("MONEDAS_A_ESCANEAR", "").replace(" ", "").lower()
+    if not filtro:
+        return [m for m in MONEDAS if m[0] not in _DESTINOS_DE_COPIA]
+    pedidas = [c for c in filtro.split(",") if c]
+    conocidas = {m[0] for m in MONEDAS}
+    desconocidas = [c for c in pedidas if c not in conocidas]
+    if desconocidas:
+        raise SystemExit(f"MONEDAS_A_ESCANEAR trae códigos que no existen en MONEDAS: {desconocidas}")
+    return [m for m in MONEDAS if m[0] in pedidas]
 
+
+def _correr(monedas):
+    """Escanea y sube cada moneda de la lista. Devuelve los códigos que fallaron."""
     fallidas = []
     with ThreadPoolExecutor(max_workers=MONEDAS_EN_PARALELO) as pool:
         futuros = {
             pool.submit(escanear_y_subir, cc, symbol, no_dec, gog): cc
-            for cc, symbol, no_dec, gog in MONEDAS
+            for cc, symbol, no_dec, gog in monedas
         }
         for futuro in as_completed(futuros):
             cc_code = futuros[futuro]
@@ -326,6 +419,24 @@ def main():
                 # lo que ya había en Firebase para esa moneda.
                 print(f"[{cc_code}] ERROR: {type(e).__name__}: {e}")
                 fallidas.append(cc_code)
+    return fallidas
+
+
+def main():
+    cred = credentials.Certificate(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": os.environ["FIREBASE_DATABASE_URL"],
+    })
+
+    monedas = _monedas_a_escanear()
+    fallidas = _correr(monedas)
+
+    if fallidas:
+        # Casi siempre es un bloqueo temporal de Steam: se espera un rato y se prueba
+        # otra vez solo con las que fallaron.
+        print(f"Falló: {', '.join(sorted(fallidas))}. Reintento en {PAUSA_ANTES_DE_REINTENTAR}s...")
+        time.sleep(PAUSA_ANTES_DE_REINTENTAR)
+        fallidas = _correr([m for m in monedas if m[0] in fallidas])
 
     if fallidas:
         # Salir con error hace que GitHub marque la corrida en rojo y te mande un correo,

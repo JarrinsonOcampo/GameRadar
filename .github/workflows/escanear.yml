@@ -1,14 +1,24 @@
 # Este archivo va en: .github/workflows/escanear.yml (dentro del repo del backend)
 #
-# Corre subir_a_firebase.py automáticamente cada 4 horas (hora UTC) y
+# Corre subir_a_firebase.py automáticamente cada 6 horas (hora UTC) y
 # también se puede lanzar a mano desde la pestaña "Actions" de GitHub
 # con el botón "Run workflow" (gracias a workflow_dispatch).
 #
-# Las 10 monedas se escanean UNA A LA VEZ (con pausas entre páginas) para no
-# ser bloqueados por Steam. Un run completo tarda ~30-45 minutos.
+# La app tiene 19 monedas, pero Steam solo se ESCANEA 12 veces: Steam da el mismo precio a
+# Panamá, Argentina, Bolivia, Ecuador, Paraguay, Venezuela, El Salvador y Nicaragua (región
+# "Latinoamérica USD"), así que Steam se escanea una sola vez ("pa") y esa lista se
+# reutiliza en los otros 7; Epic y GOG sí se consultan por país (ver COPIAS en
+# subir_a_firebase.py).
+# Los 12 escaneos se reparten en 4 grupos (matrix) que corren EN PARALELO, cada
+# grupo en su propia máquina (con su propia IP). Dentro de cada grupo las monedas
+# se escanean UNA A LA VEZ, con pausas, para no ser bloqueados por Steam.
+# Si una moneda falla por bloqueo, se reintenta una vez al final del job.
+#
+# Para mover una moneda de grupo, solo cambia su código en la lista "monedas"
+# de abajo (los códigos deben existir en MONEDAS de subir_a_firebase.py).
 #
 # En un repo PÚBLICO los minutos de GitHub Actions son ilimitados. En uno
-# PRIVADO son 2000/mes: con este ritmo (4 runs/día) no alcanzarían.
+# PRIVADO son 2000/mes y esto gasta ~300 minutos al día: no alcanzaría.
 #
 # ⚠️ GitHub DESACTIVA los workflows programados de un repo PÚBLICO después de
 # 60 días sin actividad (commits, etc.). Si un día dejan de actualizarse las
@@ -33,8 +43,23 @@ concurrency:
 
 jobs:
   escanear:
+    name: escanear (${{ matrix.grupo }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 75
+
+    strategy:
+      # Si un grupo falla, los demás terminan y suben lo suyo igual.
+      fail-fast: false
+      matrix:
+        include:
+          - grupo: A
+            monedas: "co,us,es,mx"
+          - grupo: B
+            monedas: "cl,pe,br"
+          - grupo: C
+            monedas: "pa,gb"
+          - grupo: D
+            monedas: "cr,uy,ca"
 
     steps:
       - name: Descargar el repo
@@ -58,6 +83,7 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: firebase-key.json
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          MONEDAS_A_ESCANEAR: ${{ matrix.monedas }}
         run: python subir_a_firebase.py
 
       - name: Borrar la clave (no debe quedar en los logs ni en el runner)
